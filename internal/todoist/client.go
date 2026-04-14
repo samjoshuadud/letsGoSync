@@ -163,6 +163,12 @@ func (c *Client) GetCompletedItems(ctx context.Context, projectID string) ([]Tas
 	params := url.Values{}
 	params.Set("project_id", projectID)
 	params.Set("limit", "200")
+	// Todoist v1 requires both since and until, and date range must not exceed 3 months.
+	// Keep this conservative to avoid boundary rejections across month-length differences.
+	since := time.Now().UTC().AddDate(0, 0, -88).Format(time.RFC3339)
+	until := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
+	params.Set("since", since)
+	params.Set("until", until)
 	endpoint := baseURL + "/tasks/completed/by_completion_date?" + params.Encode()
 	req, err := c.newRequest(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {

@@ -1,6 +1,7 @@
 package moodle
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -165,24 +166,96 @@ func (c *Client) scrapeWithSession(ctx context.Context, includeLessons bool) ([]
 		return nil, err
 	}
 	if len(courseLinks) == 0 {
-		return nil, errors.New("no courses found on /my/courses.php")
+		fallbackPages := []string{"/my/", "/my/index.php", "/course/index.php?mycourses=1"}
+		for _, page := range fallbackPages {
+			pageHTML, pageErr := c.getPath(ctx, page)
+			if pageErr != nil {
+				continue
+			}
+			pageLinks, parseErr := parseCourseLinks(c.baseURL, pageHTML)
+			if parseErr != nil {
+				continue
+			}
+			courseLinks = appendUniqueLinks(courseLinks, pageLinks...)
+		}
 	}
+	if len(courseLinks) == 0 {
+		apiLinks, apiErr := c.getCourseLinksFromOverviewAPI(ctx, body)
+		if apiErr == nil {
+			courseLinks = appendUniqueLinks(courseLinks, apiLinks...)
+		}
+	}
+	if len(courseLinks) == 0 {
+		return nil, errors.New("no courses found from Moodle pages; your session may be on a dashboard layout without static course links, or session cookie may be expired")
+	}
+
+	type scrapeJob struct {
+		link string
+	}
+	type scrapeResult struct {
+		items []model.Assignment
+		err   error
+		link  string
+	}
+
+	workerCount := 2
+	if len(courseLinks) < workerCount {
+		workerCount = len(courseLinks)
+	}
+	if workerCount <= 0 {
+		workerCount = 1
+	}
+
+	jobs := make(chan scrapeJob)
+	results := make(chan scrapeResult, len(courseLinks))
+
+	// Global pacing keeps requests moderate even with concurrency.
+	requestTicker := time.NewTicker(350 * time.Millisecond)
+	defer requestTicker.Stop()
+
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			for job := range jobs {
+				select {
+				case <-ctx.Done():
+					results <- scrapeResult{err: ctx.Err(), link: job.link}
+					continue
+				case <-requestTicker.C:
+				}
+
+				html, fetchErr := c.getURL(ctx, job.link)
+				if fetchErr != nil {
+					results <- scrapeResult{err: fetchErr, link: job.link}
+					continue
+				}
+				items, parseErr := c.extractFromCourseHTML(ctx, job.link, html, includeLessons)
+				if parseErr != nil {
+					results <- scrapeResult{err: parseErr, link: job.link}
+					continue
+				}
+				results <- scrapeResult{items: items, link: job.link}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(jobs)
+		for _, link := range courseLinks {
+			jobs <- scrapeJob{link: link}
+		}
+	}()
 
 	var all []model.Assignment
 	var failures []string
-	for _, link := range courseLinks {
-		html, fetchErr := c.getURL(ctx, link)
-		if fetchErr != nil {
-			failures = append(failures, fmt.Sprintf("%s: %v", link, fetchErr))
+	for i := 0; i < len(courseLinks); i++ {
+		r := <-results
+		if r.err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", r.link, r.err))
 			continue
 		}
-		items, parseErr := c.extractFromCourseHTML(ctx, link, html, includeLessons)
-		if parseErr != nil {
-			failures = append(failures, fmt.Sprintf("%s: %v", link, parseErr))
-			continue
-		}
-		all = append(all, items...)
+		all = append(all, r.items...)
 	}
+
 	if len(all) == 0 && len(failures) > 0 {
 		return nil, fmt.Errorf("failed to scrape all courses; first error: %s", failures[0])
 	}
@@ -334,9 +407,12 @@ func parseCourseLinks(baseURL, html string) ([]string, error) {
 	}
 	seen := map[string]struct{}{}
 	var links []string
-	doc.Find(`a[href*="/course/view.php?id="]`).Each(func(_ int, s *goquery.Selection) {
+	doc.Find("a[href]").Each(func(_ int, s *goquery.Selection) {
 		href, ok := s.Attr("href")
 		if !ok || strings.TrimSpace(href) == "" {
+			return
+		}
+		if !strings.Contains(href, "course/view.php?id=") {
 			return
 		}
 		full := resolveURL(baseURL, href)
@@ -346,6 +422,26 @@ func parseCourseLinks(baseURL, html string) ([]string, error) {
 		seen[full] = struct{}{}
 		links = append(links, full)
 	})
+	doc.Find(`[data-course-id]`).Each(func(_ int, s *goquery.Selection) {
+		courseID := strings.TrimSpace(s.AttrOr("data-course-id", ""))
+		if courseID == "" {
+			return
+		}
+		full := resolveURL(baseURL, "/course/view.php?id="+courseID)
+		if _, exists := seen[full]; exists {
+			return
+		}
+		seen[full] = struct{}{}
+		links = append(links, full)
+	})
+	for _, raw := range extractCourseLinksFromRawHTML(html) {
+		full := resolveURL(baseURL, raw)
+		if _, exists := seen[full]; exists {
+			continue
+		}
+		seen[full] = struct{}{}
+		links = append(links, full)
+	}
 	sort.Strings(links)
 	return links, nil
 }
@@ -565,6 +661,142 @@ func findLogintoken(html string) string {
 		return ""
 	}
 	return strings.TrimSpace(m[1])
+}
+
+func findSesskey(html string) string {
+	patterns := []*regexp.Regexp{
+		regexp.MustCompile(`"sesskey"\s*:\s*"([A-Za-z0-9]+)"`),
+		regexp.MustCompile(`sesskey["']?\s*[:=]\s*["']([A-Za-z0-9]+)["']`),
+		regexp.MustCompile(`name="sesskey"\s+value="([^"]+)"`),
+	}
+	for _, re := range patterns {
+		m := re.FindStringSubmatch(html)
+		if len(m) > 1 {
+			return strings.TrimSpace(m[1])
+		}
+	}
+	return ""
+}
+
+func extractCourseLinksFromRawHTML(html string) []string {
+	unescaped := strings.ReplaceAll(html, `\/`, `/`)
+	re := regexp.MustCompile(`(?:https?://[^\s"'<>]+/course/view\.php\?id=\d+|/course/view\.php\?id=\d+|course/view\.php\?id=\d+)`)
+	matches := re.FindAllString(unescaped, -1)
+	seen := map[string]struct{}{}
+	var links []string
+	for _, match := range matches {
+		if _, exists := seen[match]; exists {
+			continue
+		}
+		seen[match] = struct{}{}
+		links = append(links, match)
+	}
+	return links
+}
+
+func appendUniqueLinks(base []string, more ...string) []string {
+	seen := map[string]struct{}{}
+	for _, link := range base {
+		seen[link] = struct{}{}
+	}
+	for _, link := range more {
+		link = strings.TrimSpace(link)
+		if link == "" {
+			continue
+		}
+		if _, exists := seen[link]; exists {
+			continue
+		}
+		seen[link] = struct{}{}
+		base = append(base, link)
+	}
+	sort.Strings(base)
+	return base
+}
+
+func (c *Client) getCourseLinksFromOverviewAPI(ctx context.Context, html string) ([]string, error) {
+	sesskey := findSesskey(html)
+	if sesskey == "" {
+		return nil, errors.New("sesskey not found")
+	}
+
+	endpoint := c.baseURL + "/lib/ajax/service.php?sesskey=" + url.QueryEscape(sesskey) + "&info=core_course_get_enrolled_courses_by_timeline_classification"
+	payload := `[{"index":0,"methodname":"core_course_get_enrolled_courses_by_timeline_classification","args":{"offset":0,"limit":0,"classification":"all","sort":"fullname"}}]`
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBufferString(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	if c.sessionCookie != "" {
+		req.Header.Set("Cookie", c.sessionCookie)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, fmt.Errorf("overview API request failed (%s)", resp.Status)
+	}
+
+	var calls []map[string]any
+	if err := json.Unmarshal(data, &calls); err != nil {
+		return nil, err
+	}
+
+	var links []string
+	for _, call := range calls {
+		callData, ok := call["data"].(map[string]any)
+		if !ok {
+			continue
+		}
+		courses, ok := callData["courses"].([]any)
+		if !ok {
+			continue
+		}
+		for _, rawCourse := range courses {
+			course, ok := rawCourse.(map[string]any)
+			if !ok {
+				continue
+			}
+			viewURL, _ := course["viewurl"].(string)
+			if strings.TrimSpace(viewURL) != "" {
+				links = append(links, resolveURL(c.baseURL, viewURL))
+				continue
+			}
+			courseID := int64FromAny(course["id"])
+			if courseID > 0 {
+				links = append(links, resolveURL(c.baseURL, fmt.Sprintf("/course/view.php?id=%d", courseID)))
+			}
+		}
+	}
+	links = appendUniqueLinks(nil, links...)
+	if len(links) == 0 {
+		return nil, errors.New("overview API returned no course links")
+	}
+	return links, nil
+}
+
+func int64FromAny(v any) int64 {
+	switch x := v.(type) {
+	case float64:
+		return int64(x)
+	case int:
+		return int64(x)
+	case int64:
+		return x
+	case json.Number:
+		i, _ := x.Int64()
+		return i
+	default:
+		return 0
+	}
 }
 
 func resolveURL(base, href string) string {
