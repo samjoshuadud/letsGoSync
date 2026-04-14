@@ -198,7 +198,7 @@ func (c *Client) scrapeWithSession(ctx context.Context, includeLessons bool) ([]
 		link  string
 	}
 
-	workerCount := 6
+	workerCount := 12
 	if len(courseLinks) < workerCount {
 		workerCount = len(courseLinks)
 	}
@@ -210,7 +210,7 @@ func (c *Client) scrapeWithSession(ctx context.Context, includeLessons bool) ([]
 	results := make(chan scrapeResult, len(courseLinks))
 
 	// Global pacing keeps requests moderate even with concurrency.
-	requestTicker := time.NewTicker(80 * time.Millisecond)
+	requestTicker := time.NewTicker(15 * time.Millisecond)
 	defer requestTicker.Stop()
 
 	for i := 0; i < workerCount; i++ {
