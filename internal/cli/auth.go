@@ -27,7 +27,8 @@ func newAuthCmd() *cobra.Command {
 }
 
 func newAuthStatusCmd() *cobra.Command {
-	return &cobra.Command{
+	var testAuth bool
+	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show auth credential status",
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -53,29 +54,36 @@ func newAuthStatusCmd() *cobra.Command {
 				MoodleSessionCookiePresent bool   `json:"moodle_session_cookie_present"`
 				MoodleWebTokenPresent      bool   `json:"moodle_web_token_present"`
 				TodoistTokenPresent        bool   `json:"todoist_token_present"`
-				MoodleSessionValid         bool   `json:"moodle_session_valid"`
-				MoodleTokenValid           bool   `json:"moodle_token_valid"`
-				TodoistTokenValid          bool   `json:"todoist_token_valid"`
+				MoodleSessionValid         *bool  `json:"moodle_session_valid,omitempty"`
+				MoodleTokenValid           *bool  `json:"moodle_token_valid,omitempty"`
+				TodoistTokenValid          *bool  `json:"todoist_token_valid,omitempty"`
+				Tested                     bool   `json:"tested"`
 				BaseURL                    string `json:"base_url"`
 			}
 			resp := out{
 				MoodleSessionCookiePresent: sessionCookie != "",
 				MoodleWebTokenPresent:      webToken != "",
 				TodoistTokenPresent:        todoistToken != "",
+				Tested:                     testAuth,
 				BaseURL:                    cfg.MoodleBaseURL,
 			}
 
-			moodleClient := moodle.NewClient(cfg.MoodleBaseURL)
-			if sessionCookie != "" {
-				moodleClient.SetSessionCookie(sessionCookie)
-				resp.MoodleSessionValid = moodleClient.ValidateSession(context.Background()) == nil
-			}
-			if webToken != "" {
-				moodleClient.SetWebServiceToken(webToken)
-				resp.MoodleTokenValid = moodleClient.ValidateToken(context.Background()) == nil
-			}
-			if todoistToken != "" {
-				resp.TodoistTokenValid = todoist.NewClient(todoistToken).TestConnection(context.Background()) == nil
+			if testAuth {
+				moodleClient := moodle.NewClient(cfg.MoodleBaseURL)
+				if sessionCookie != "" {
+					moodleClient.SetSessionCookie(sessionCookie)
+					ok := moodleClient.ValidateSession(context.Background()) == nil
+					resp.MoodleSessionValid = &ok
+				}
+				if webToken != "" {
+					moodleClient.SetWebServiceToken(webToken)
+					ok := moodleClient.ValidateToken(context.Background()) == nil
+					resp.MoodleTokenValid = &ok
+				}
+				if todoistToken != "" {
+					ok := todoist.NewClient(todoistToken).TestConnection(context.Background()) == nil
+					resp.TodoistTokenValid = &ok
+				}
 			}
 
 			if opts.JSON {
@@ -83,12 +91,32 @@ func newAuthStatusCmd() *cobra.Command {
 			}
 
 			fmt.Printf("Moodle base URL: %s\n", resp.BaseURL)
-			fmt.Printf("Moodle session cookie: %t (valid: %t)\n", resp.MoodleSessionCookiePresent, resp.MoodleSessionValid)
-			fmt.Printf("Moodle web-service token: %t (valid: %t)\n", resp.MoodleWebTokenPresent, resp.MoodleTokenValid)
-			fmt.Printf("Todoist token: %t (valid: %t)\n", resp.TodoistTokenPresent, resp.TodoistTokenValid)
+			fmt.Printf("Auth test checks: %s\n", ternary(testAuth, "enabled", "disabled (use --test)"))
+			fmt.Printf("Moodle session cookie: %t (valid: %s)\n", resp.MoodleSessionCookiePresent, boolStatus(resp.MoodleSessionValid))
+			fmt.Printf("Moodle web-service token: %t (valid: %s)\n", resp.MoodleWebTokenPresent, boolStatus(resp.MoodleTokenValid))
+			fmt.Printf("Todoist token: %t (valid: %s)\n", resp.TodoistTokenPresent, boolStatus(resp.TodoistTokenValid))
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&testAuth, "test", false, "Actively test stored credentials against Moodle/Todoist APIs")
+	return cmd
+}
+
+func boolStatus(v *bool) string {
+	if v == nil {
+		return "not tested"
+	}
+	if *v {
+		return "true"
+	}
+	return "false"
+}
+
+func ternary(cond bool, trueVal, falseVal string) string {
+	if cond {
+		return trueVal
+	}
+	return falseVal
 }
 
 func newAuthLoginCmd() *cobra.Command {

@@ -42,7 +42,7 @@ If your Moodle is Google-auth-only, use **session cookie mode**:
 Then run:
 
 ```bash
-./moodletodo auth status
+./moodletodo auth status --test
 ./moodletodo run
 ```
 
@@ -114,10 +114,9 @@ Manage Todoist token.
 
 ## `auth status`
 
-No command-specific flags besides help.
-
 | Flag | What it does | Example |
 | --- | --- | --- |
+| `--test` | Actively test stored Moodle session token / web-service token / Todoist token against live APIs | `./moodletodo auth status --test` |
 | `-h`, `--help` | Help | `./moodletodo auth status --help` |
 
 ## `config show`
